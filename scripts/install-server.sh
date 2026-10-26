@@ -10,9 +10,8 @@ apt-get install -y docker.io docker-compose-v2
 systemctl enable --now docker
 docker compose config --quiet
 docker compose up -d --build metube
-if grep -Eq '^TG_BOT_TOKEN=[0-9]+:[A-Za-z0-9_-]+' .env; then
-  docker compose --profile bot up -d --build bot
+if python3 scripts/prepare-local.py; then
+  bash scripts/switch-local-api.sh
 else
-  echo "MeTube started. Set TG_BOT_TOKEN in .env, then run: sudo docker compose --profile bot up -d --build"
+  echo "MeTube started. Configure credentials in .env, then run: sudo bash scripts/switch-local-api.sh"
 fi
-docker compose --profile bot ps

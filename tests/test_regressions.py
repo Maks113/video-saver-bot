@@ -15,7 +15,7 @@ from aiogram.methods import EditMessageText
 from yt_dlp import YoutubeDL, parse_options
 
 from app.bot import Config, VideoBot
-from app.downloader import download, make_command, work_size
+from app.downloader import download, make_command, work_size, TooLarge
 
 
 class ReviewRegressions(unittest.IsolatedAsyncioTestCase):
@@ -113,10 +113,10 @@ class FileAndFormatRegressions(unittest.TestCase):
             directory = SimpleNamespace(iterdir=lambda: iter([vanished, stable]))
             self.assertEqual(work_size(directory), 4)
 
-    def test_real_ytdlp_selects_smaller_format_when_720p_exceeds_limit(self):
+    def test_local_mode_accepts_best_format_larger_than_old_50mb_limit(self):
         with tempfile.TemporaryDirectory() as tmp:
             with patch("app.downloader.Path.is_file", return_value=False):
-                cmd = make_command("https://youtu.be/test", Path(tmp), "youtube", 50_000_000)
+                cmd = make_command("https://youtu.be/test", Path(tmp), "youtube", 2_000_000_000)
             options = parse_options(cmd[3:]).ydl_opts
             info = {
                 "id": "fixture", "title": "Size fixture", "extractor": "fixture",
@@ -131,56 +131,33 @@ class FileAndFormatRegressions(unittest.TestCase):
             }
             with YoutubeDL(options) as ydl:
                 selected = ydl.process_ie_result(info, download=False)
-            self.assertEqual(selected["format_id"], "480")
+            self.assertEqual(selected["format_id"], "720")
 
 
 class AdditionalBoundaryRegressions(unittest.IsolatedAsyncioTestCase):
-    async def test_unknown_sizes_and_merged_track_total_retry_lower_quality(self):
-        for reason in ["skipped", "merged"]:
-            with self.subTest(reason=reason), tempfile.TemporaryDirectory() as tmp:
-                root = Path(tmp)
-                heights = []
-
-                def command(url, directory, *args, height=720, **kwargs):
-                    heights.append(height)
-                    self.assertEqual(len(list(root.glob("attempt-*"))), 1)
-                    if height == 720 and reason == "skipped":
-                        script = "pass"  # yt-dlp skips oversized files with exit code zero.
-                    else:
-                        size = 60 if height == 720 else 20
-                        script = (
-                            "import pathlib,sys,json; root=pathlib.Path(sys.argv[1]);"
-                            "(root/'video.f1.mp4').write_bytes(b'x'*40);"
-                            "(root/'video.f2.m4a').write_bytes(b'x'*20);"
-                            "p=root/'video.mp4'; p.write_bytes(b'x'*" + str(size) + ");"
-                            "print(json.dumps(str(p)))"
-                        )
-                    return [sys.executable, "-c", script, str(directory)]
-
-                with patch("app.downloader.make_command", side_effect=command):
-                    result = await download("https://youtu.be/test", root, limit=50)
-                self.assertEqual(heights, [720, 480])
-                self.assertEqual(result.stat().st_size, 20)
-                self.assertEqual(list(root.iterdir()), [result])
-
-    async def test_quality_attempts_share_one_deadline(self):
+    async def test_oversized_merged_result_is_rejected_and_cleaned_without_retry(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
-            heights = []
 
-            def command(url, directory, *args, height=720, **kwargs):
-                heights.append(height)
+            def command(url, directory, *args, **kwargs):
                 script = (
-                    "import time,pathlib,sys,json; time.sleep(0.1);"
-                    "p=pathlib.Path(sys.argv[1])/'video.mp4';"
+                    "import pathlib,sys,json; p=pathlib.Path(sys.argv[1])/'video.mp4';"
                     "p.write_bytes(b'x'*60); print(json.dumps(str(p)))"
                 )
                 return [sys.executable, "-c", script, str(directory)]
 
-            with patch("app.downloader.make_command", side_effect=command):
+            with patch("app.downloader.make_command", side_effect=command) as mocked:
+                with self.assertRaises(TooLarge):
+                    await download("https://youtu.be/test", root, limit=50)
+            self.assertEqual(mocked.call_count, 1)
+            self.assertEqual(list(root.iterdir()), [])
+
+    async def test_single_download_has_a_deadline(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            with patch("app.downloader.make_command", return_value=[sys.executable, "-c", "import time; time.sleep(10)"]):
                 with self.assertRaises(TimeoutError):
-                    await download("https://youtu.be/test", root, limit=50, timeout=0.4)
-            self.assertLess(len(heights), 5)
+                    await download("https://youtu.be/test", root, limit=50, timeout=0.1)
             self.assertEqual(list(root.iterdir()), [])
 
     async def test_cleanup_of_stuck_wait_and_reader_has_a_deadline(self):

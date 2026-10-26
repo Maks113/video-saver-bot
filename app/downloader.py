@@ -11,10 +11,10 @@ import sys
 import tempfile
 from urllib.parse import urlsplit
 
-MAX_UPLOAD_BYTES = 50_000_000
-MAX_WORK_BYTES = 110_000_000
+MAX_UPLOAD_BYTES = 2_000_000_000
+MAX_WORK_BYTES = 3 * MAX_UPLOAD_BYTES + 100_000_000
+DISK_RESERVE_BYTES = 1_000_000_000
 CLEANUP_TIMEOUT = 2
-QUALITY_HEIGHTS = (720, 480, 360, 240, 144)
 ALLOWED_DOMAINS = {
     "youtube.com": "youtube", "youtu.be": "youtube",
     "instagram.com": "instagram",
@@ -29,10 +29,6 @@ class DownloadError(Exception):
 
 class TooLarge(DownloadError):
     pass
-
-
-class NoVideo(DownloadError):
-    """yt-dlp skipped a download, possibly because its size was unknown."""
 
 
 def validate_url(text: str) -> tuple[str, str]:
@@ -53,9 +49,7 @@ def validate_url(text: str) -> tuple[str, str]:
     raise DownloadError("Поддерживаются Instagram, YouTube, VK Видео и TikTok.")
 
 
-def make_command(url: str, directory: Path, site: str, limit: int, *, height: int = 720) -> list[str]:
-    video = f"[height<={height}][filesize<=?{limit}]"
-    audio = f"[filesize<=?{limit}]"
+def make_command(url: str, directory: Path, site: str, limit: int) -> list[str]:
     cmd = [
         sys.executable, "-m", "yt_dlp",
         "--ignore-config", "--no-playlist", "--playlist-items", "1",
@@ -64,8 +58,10 @@ def make_command(url: str, directory: Path, site: str, limit: int, *, height: in
         "--use-extractors", "youtube.*,instagram.*,vk.*,tiktok.*",
         "--match-filters", "!is_live",
         "--max-filesize", str(limit),
-        "--format", f"bv*{video}[ext=mp4]+ba{audio}[ext=m4a]/b{video}[ext=mp4]/b{video}",
-        "--format-sort", "vcodec:h264",
+        "--format", "bv*[ext=mp4]+ba[ext=m4a]/b[ext=mp4]/bv*+ba/b",
+        # yt-dlp's res sorting uses the short side, including portrait videos.
+        # This is a preference, not a filter excluding higher-only formats.
+        "--format-sort", "res:720,vcodec:h264",
         "--merge-output-format", "mp4",
         "--output", str(directory / "video.%(ext)s"),
         "--print", "after_move:%(filepath)j",
@@ -138,9 +134,9 @@ def checked_file(path: Path, directory: Path, limit: int) -> Path:
     return resolved
 
 
-async def _download_attempt(url: str, directory: Path, site: str, limit: int, height: int) -> Path:
+async def _download_attempt(url: str, directory: Path, site: str, limit: int) -> Path:
     proc = await asyncio.create_subprocess_exec(
-        *make_command(url, directory, site, limit, height=height),
+        *make_command(url, directory, site, limit),
         stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
         start_new_session=True,
     )
@@ -148,8 +144,10 @@ async def _download_attempt(url: str, directory: Path, site: str, limit: int, he
     try:
         while not reader.done():
             await asyncio.sleep(0.05)
-            if work_size(directory) > MAX_WORK_BYTES:
+            if work_size(directory) > min(MAX_WORK_BYTES, 3 * limit + 100_000_000):
                 raise TooLarge
+            if shutil.disk_usage(directory).free < DISK_RESERVE_BYTES:
+                raise DownloadError("На сервере недостаточно свободного места для скачивания.")
         stdout, stderr = await reader
     finally:
         cleanup = asyncio.create_task(stop_process(proc, reader))
@@ -168,7 +166,7 @@ async def _download_attempt(url: str, directory: Path, site: str, limit: int, he
         raise DownloadError("Не удалось скачать видео. Проверь доступность ссылки или попробуй MeTube.")
     lines = stdout.decode("utf-8", errors="replace").splitlines()
     if not lines:
-        raise NoVideo("Видео не скачано: возможно, оно больше 50 МБ или недоступно. Попробуй MeTube.")
+        raise DownloadError("Видео не скачано: возможно, оно превышает лимит или недоступно. Попробуй MeTube.")
     try:
         path = Path(json.loads(lines[-1]))
     except (ValueError, TypeError):
@@ -178,17 +176,11 @@ async def _download_attempt(url: str, directory: Path, site: str, limit: int, he
 
 async def download(url: str, directory: Path, *, limit=MAX_UPLOAD_BYTES, timeout=600) -> Path:
     url, site = validate_url(url)
-    # One deadline covers all quality attempts, not a new timeout per attempt.
+    if shutil.disk_usage(directory).free < 3 * limit + DISK_RESERVE_BYTES:
+        raise DownloadError("На сервере недостаточно места для видео и временных дорожек.")
     async with asyncio.timeout(timeout):
-        for height in QUALITY_HEIGHTS:
-            # Remove partial tracks and cookie copies before the next attempt.
-            with tempfile.TemporaryDirectory(prefix="attempt-", dir=directory) as tmp:
-                try:
-                    path = await _download_attempt(url, Path(tmp), site, limit, height)
-                except (TooLarge, NoVideo) as exc:
-                    last_error = exc
-                    continue
-                result = directory / ("video" + path.suffix)
-                path.replace(result)
-                return checked_file(result, directory, limit)
-        raise last_error
+        with tempfile.TemporaryDirectory(prefix="attempt-", dir=directory) as tmp:
+            path = await _download_attempt(url, Path(tmp), site, limit)
+            result = directory / ("video" + path.suffix)
+            path.replace(result)
+            return checked_file(result, directory, limit)

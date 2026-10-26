@@ -3,8 +3,7 @@ services:
   metube:
     image: ghcr.io/alexta69/metube:2026.10.25
     restart: unless-stopped
-    ports:
-      - "${METUBE_BIND_IP:-127.0.0.1}:${METUBE_PORT:-8081}:8081"
+    ports: ["${METUBE_BIND_IP:-127.0.0.1}:${METUBE_PORT:-8081}:8081"]
     environment:
       PUID: "${PUID:-1000}"
       PGID: "${PGID:-1000}"
@@ -20,9 +19,48 @@ services:
     logging:
       driver: json-file
       options: {max-size: "10m", max-file: "3"}
+  telegram-bot-api:
+    profiles: [bot]
+    image: aiogram/telegram-bot-api@sha256:3f92ea1b5fcb27344d991ab1464af08675a2e202f901c68fccdf570d77ec02bf
+    restart: unless-stopped
+    init: true
+    user: "${PUID:-1000}:${PGID:-1000}"
+    entrypoint: ["/usr/local/bin/telegram-bot-api"]
+    command:
+      - --local
+      - --dir=/var/lib/telegram-bot-api
+      - --temp-dir=/api-tmp
+      - --http-port=8081
+      - --http-ip-address=0.0.0.0
+      - --http-stat-port=8082
+      - --verbosity=0
+    environment:
+      TELEGRAM_API_ID: "${TELEGRAM_API_ID:-}"
+      TELEGRAM_API_HASH: "${TELEGRAM_API_HASH:-}"
+    volumes:
+      - ./data/bot-api:/var/lib/telegram-bot-api
+      - ./data/bot-api-tmp:/api-tmp
+      - ./data/bot-downloads:/downloads:ro
+    healthcheck:
+      test: ["CMD", "wget", "-q", "-O", "/dev/null", "http://127.0.0.1:8082/"]
+      interval: 5s
+      timeout: 3s
+      retries: 12
+      start_period: 5s
+    mem_limit: 2g
+    cpus: 2
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    stop_grace_period: 30s
+    logging:
+      driver: json-file
+      options: {max-size: "10m", max-file: "3"}
   bot:
     profiles: [bot]
     build: .
+    depends_on:
+      telegram-bot-api:
+        condition: service_healthy
     restart: unless-stopped
     init: true
     user: "${PUID:-1000}:${PGID:-1000}"
@@ -30,13 +68,17 @@ services:
       TG_BOT_TOKEN: "${TG_BOT_TOKEN:-}"
       TG_ALLOWED_USER_IDS: "${TG_ALLOWED_USER_IDS:-}"
       METUBE_URL: "${METUBE_URL:-http://localhost:8081}"
-      DOWNLOAD_TIMEOUT: "600"
-      MAX_UPLOAD_BYTES: "50000000"
+      BOT_API_BASE: http://telegram-bot-api:8081
+      DOWNLOAD_DIR: /downloads
+      DOWNLOAD_TIMEOUT: "${DOWNLOAD_TIMEOUT:-1800}"
+      UPLOAD_TIMEOUT: "${UPLOAD_TIMEOUT:-7200}"
+      MAX_UPLOAD_BYTES: "${MAX_UPLOAD_BYTES:-2000000000}"
       TMPDIR: /tmp
     volumes:
       - ./cookies:/cookies:ro
+      - ./data/bot-downloads:/downloads
     tmpfs:
-      - /tmp:size=268435456,mode=1777
+      - /tmp:size=67108864,mode=1777
     read_only: true
     cap_drop: [ALL]
     security_opt: [no-new-privileges:true]

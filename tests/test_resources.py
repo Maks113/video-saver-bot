@@ -52,7 +52,7 @@ class ResourceTests(unittest.IsolatedAsyncioTestCase):
             root = Path(storage)
             with patch("app.bot.download", new=fake_download), \
                     patch("app.bot.tempfile.TemporaryDirectory",
-                          new=lambda **kwargs: tempdir_factory(dir=root, **kwargs)), \
+                          new=lambda **kwargs: tempdir_factory(dir=root, **{k: v for k, v in kwargs.items() if k != "dir"})), \
                     patch("app.bot.log.warning", new=lambda *args, **kwargs: None):
                 task = asyncio.create_task(service.worker())
 

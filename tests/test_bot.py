@@ -24,8 +24,8 @@ class ConfigTests(unittest.TestCase):
         config = self.load()
         self.assertEqual(config.token, "123:fake")
         self.assertEqual(config.users, frozenset({123, 456}))
-        self.assertEqual(config.limit, 50_000_000)
-        self.assertEqual(config.timeout, 600)
+        self.assertEqual(config.limit, 2_000_000_000)
+        self.assertEqual(config.timeout, 1800)
         self.assertEqual(config.metube_url, "http://localhost:8081")
 
     def test_custom_limits_and_url(self):
@@ -38,8 +38,8 @@ class ConfigTests(unittest.TestCase):
             {"TG_ALLOWED_USER_IDS": ""}, {"TG_ALLOWED_USER_IDS": "0"},
             {"TG_ALLOWED_USER_IDS": "-1"}, {"TG_ALLOWED_USER_IDS": "abc"},
             {"MAX_UPLOAD_BYTES": "abc"}, {"MAX_UPLOAD_BYTES": "0"},
-            {"MAX_UPLOAD_BYTES": "50000001"}, {"DOWNLOAD_TIMEOUT": "0"},
-            {"DOWNLOAD_TIMEOUT": "1801"}, {"DOWNLOAD_TIMEOUT": "oops"},
+            {"MAX_UPLOAD_BYTES": "2000000001"}, {"DOWNLOAD_TIMEOUT": "0"},
+            {"DOWNLOAD_TIMEOUT": "7201"}, {"DOWNLOAD_TIMEOUT": "oops"},
         ]:
             with self.subTest(updates=updates), self.assertRaises(SystemExit):
                 self.load(**updates)
@@ -188,7 +188,7 @@ class BotTests(unittest.IsolatedAsyncioTestCase):
     async def test_download_errors_do_not_upload(self):
         for error, expected in [
             (TooLarge(), "metube.local"),
-            (TimeoutError(), "10 минут"),
+            (TimeoutError(), "600 с"),
             (DownloadError("Видео недоступно"), "Видео недоступно"),
         ]:
             with self.subTest(error=type(error)):
@@ -229,7 +229,7 @@ class BotTests(unittest.IsolatedAsyncioTestCase):
         message, status = await self.run_worker(fake_download)
         message.answer_video.assert_not_awaited()
         message.answer_document.assert_not_awaited()
-        self.assertIn("больше 50 МБ", status.edit_text.call_args.args[0])
+        self.assertIn("больше лимита", status.edit_text.call_args.args[0])
         self.assertFalse(paths[0].parent.exists())
 
     async def test_failed_upload_cleans_files_and_worker_survives(self):
@@ -301,7 +301,7 @@ class BotTests(unittest.IsolatedAsyncioTestCase):
                 if error:
                     raise error
 
-            with patch("app.bot.Bot", return_value=bot), patch("app.bot.AiohttpSession"), \
+            with patch("app.bot.Bot", return_value=bot), patch("app.bot.local_session"), patch("app.bot.workspace"), patch("app.bot.require_local_ready"), \
                     patch.object(self.service, "worker", side_effect=worker), \
                     patch.object(self.service.dp, "start_polling", side_effect=polling):
                 if error:
