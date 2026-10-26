@@ -7,3 +7,8 @@ data
 __pycache__
 tests
 README.md
+
+.coverage
+.coverage.*
+htmlcov
+coverage.xml

@@ -77,12 +77,21 @@ docker compose --profile bot down
 ```bash
 python -m venv .venv
 . .venv/bin/activate
-pip install -r requirements.txt
-python -m unittest discover -s tests -v
+pip install -r requirements-dev.txt
+python -m coverage run -m unittest discover -s tests -v
+python -m coverage report
+python -m coverage html
 docker compose --env-file .env.example config --quiet
 docker build -t video-saver-bot:test .
 ```
 
-GitHub Actions выполняет тесты, проверку Compose и сборку образа.
+GitHub Actions выполняет тесты с покрытием строк и ветвей, проверку Compose и сборку образа.
+Минимальное суммарное покрытие — 95%; HTML-отчёт сохраняется в артефактах CI.
+Локально отчёт находится в htmlcov/index.html. Исключений из измерения кода приложения нет.
 Тесты проверяют доступ, размер файлов, тайм-ауты, остановку процессов и очистку.
 Тесты не отправляют сообщения в Telegram.
+
+Регрессионные тесты ресурсов обрабатывают 240 заданий после прогрева и проверяют
+удаление временных файлов, ограниченный рост памяти Python, освобождение очереди,
+а также отсутствие дочерних процессов и открытых каналов после повторных скачиваний.
+Они работают без сети и не заменяют длительное наблюдение за реальными загрузками.
