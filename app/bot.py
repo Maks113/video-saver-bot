@@ -15,6 +15,7 @@ from aiogram.types import FSInputFile, Message
 from app.downloader import DownloadError, TooLarge, download, validate_url, MAX_UPLOAD_BYTES
 
 log = logging.getLogger(__name__)
+STATUS_TIMEOUT = 10
 
 
 @dataclass(frozen=True)
@@ -109,46 +110,53 @@ class VideoBot:
         status = await message.answer("Добавлено в очередь.")
         # Recheck after network await so simultaneous updates cannot bypass the limit.
         if user_id in self.pending or self.queue.full():
-            await status.edit_text("Предыдущее видео ещё обрабатывается или очередь заполнена.")
+            await self.update_status(status, "Предыдущее видео ещё обрабатывается или очередь заполнена.")
             return
         self.pending.add(user_id)
         self.queue.put_nowait((message, status, url, user_id))
+
+    async def update_status(self, status: Message, text: str):
+        try:
+            async with asyncio.timeout(STATUS_TIMEOUT):
+                await status.edit_text(text)
+        except (TelegramAPIError, TimeoutError):
+            # Status is optional; deleted messages/network errors cannot abort a job.
+            log.debug("Status update unavailable")
 
     async def worker(self):
         while True:
             message, status, url, user_id = await self.queue.get()
             try:
-                await status.edit_text("Скачиваю видео…")
+                await self.update_status(status, "Скачиваю видео…")
                 with tempfile.TemporaryDirectory(prefix="video-saver-") as tmp:
                     try:
                         path = await download(url, Path(tmp), limit=self.config.limit, timeout=self.config.timeout)
                     except TooLarge:
-                        await status.edit_text("Видео больше 50 МБ. Скачай его через MeTube:\n" + self.config.metube_url)
+                        await self.update_status(status, "Видео больше 50 МБ. Скачай его через MeTube:\n" + self.config.metube_url)
                         continue
                     except TimeoutError:
-                        await status.edit_text("Скачивание заняло больше 10 минут. Попробуй MeTube:\n" + self.config.metube_url)
+                        await self.update_status(status, "Скачивание заняло больше 10 минут. Попробуй MeTube:\n" + self.config.metube_url)
                         continue
                     except DownloadError as exc:
-                        await status.edit_text(str(exc))
+                        await self.update_status(status, str(exc))
                         continue
                     # Check actual final bytes immediately before uploading.
                     if path.stat().st_size > self.config.limit:
-                        await status.edit_text("Видео больше 50 МБ. MeTube:\n" + self.config.metube_url)
+                        await self.update_status(status, "Видео больше 50 МБ. MeTube:\n" + self.config.metube_url)
                         continue
-                    await status.edit_text("Отправляю видео…")
+                    await self.update_status(status, "Отправляю видео…")
                     file = FSInputFile(path, filename="video" + path.suffix)
                     if path.suffix.lower() == ".mp4":
                         await message.answer_video(file, supports_streaming=True, request_timeout=180)
                     else:
                         await message.answer_document(file, request_timeout=180)
-                    await status.edit_text("Готово.")
+                    await self.update_status(status, "Готово.")
             except asyncio.CancelledError:
                 raise
             except Exception:
                 # Do not log URLs, cookies, tokens or raw upstream errors.
                 log.warning("Video task failed")
-                with suppress(TelegramAPIError):
-                    await status.edit_text("Не удалось обработать или отправить видео. Попробуй позже.")
+                await self.update_status(status, "Не удалось обработать или отправить видео. Попробуй позже.")
             finally:
                 self.pending.discard(user_id)
                 self.queue.task_done()

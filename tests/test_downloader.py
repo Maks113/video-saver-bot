@@ -124,11 +124,11 @@ class Commands(unittest.TestCase):
 
 
 class StopProcesses(unittest.IsolatedAsyncioTestCase):
-    async def test_already_exited_process_is_reaped_without_kill(self):
+    async def test_already_exited_leader_still_triggers_group_cleanup(self):
         proc = SimpleNamespace(returncode=0, pid=123, wait=AsyncMock())
         with patch("app.downloader.os.killpg") as kill:
             await stop_process(proc)
-        kill.assert_not_called()
+        kill.assert_called_once_with(123, signal.SIGKILL)
         proc.wait.assert_awaited_once()
 
     async def test_process_exits_between_check_and_kill(self):
@@ -143,7 +143,8 @@ class Subprocesses(unittest.IsolatedAsyncioTestCase):
     async def execute(self, script, **kwargs):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
-            with patch("app.downloader.make_command", return_value=[sys.executable, "-c", script, str(root)]):
+            with patch("app.downloader.make_command", side_effect=lambda url, directory, *args, **kwargs:
+                       [sys.executable, "-c", script, str(directory)]):
                 return await download("https://youtu.be/test", root, **kwargs)
 
     async def test_successful_download(self):

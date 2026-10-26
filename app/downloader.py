@@ -6,11 +6,15 @@ from pathlib import Path
 import re
 import shutil
 import signal
+import stat
 import sys
+import tempfile
 from urllib.parse import urlsplit
 
 MAX_UPLOAD_BYTES = 50_000_000
 MAX_WORK_BYTES = 110_000_000
+CLEANUP_TIMEOUT = 2
+QUALITY_HEIGHTS = (720, 480, 360, 240, 144)
 ALLOWED_DOMAINS = {
     "youtube.com": "youtube", "youtu.be": "youtube",
     "instagram.com": "instagram",
@@ -25,6 +29,10 @@ class DownloadError(Exception):
 
 class TooLarge(DownloadError):
     pass
+
+
+class NoVideo(DownloadError):
+    """yt-dlp skipped a download, possibly because its size was unknown."""
 
 
 def validate_url(text: str) -> tuple[str, str]:
@@ -45,7 +53,9 @@ def validate_url(text: str) -> tuple[str, str]:
     raise DownloadError("Поддерживаются Instagram, YouTube, VK Видео и TikTok.")
 
 
-def make_command(url: str, directory: Path, site: str, limit: int) -> list[str]:
+def make_command(url: str, directory: Path, site: str, limit: int, *, height: int = 720) -> list[str]:
+    video = f"[height<={height}][filesize<=?{limit}]"
+    audio = f"[filesize<=?{limit}]"
     cmd = [
         sys.executable, "-m", "yt_dlp",
         "--ignore-config", "--no-playlist", "--playlist-items", "1",
@@ -54,7 +64,7 @@ def make_command(url: str, directory: Path, site: str, limit: int) -> list[str]:
         "--use-extractors", "youtube.*,instagram.*,vk.*,tiktok.*",
         "--match-filters", "!is_live",
         "--max-filesize", str(limit),
-        "--format", "bv*[height<=720][ext=mp4]+ba[ext=m4a]/b[height<=720][ext=mp4]/b[height<=720]",
+        "--format", f"bv*{video}[ext=mp4]+ba{audio}[ext=m4a]/b{video}[ext=mp4]/b{video}",
         "--format-sort", "vcodec:h264",
         "--merge-output-format", "mp4",
         "--output", str(directory / "video.%(ext)s"),
@@ -71,17 +81,49 @@ def make_command(url: str, directory: Path, site: str, limit: int) -> list[str]:
     return cmd
 
 
-async def stop_process(proc):
-    if proc.returncode is None:
-        try:
-            os.killpg(proc.pid, signal.SIGKILL)
-        except ProcessLookupError:
-            pass
-    await proc.wait()
+def _consume_task_result(task):
+    if not task.cancelled():
+        task.exception()
+
+
+async def stop_process(proc, reader=None):
+    # The leader may have exited while descendants still own the pipe handles.
+    try:
+        os.killpg(proc.pid, signal.SIGKILL)
+    except ProcessLookupError:
+        pass
+    waiters = {asyncio.create_task(proc.wait())}
+    if reader is not None:
+        waiters.add(reader)
+    for task in waiters:
+        task.add_done_callback(_consume_task_result)
+    try:
+        _, pending = await asyncio.wait(waiters, timeout=CLEANUP_TIMEOUT)
+    finally:
+        pending = {task for task in waiters if not task.done()}
+        if pending:
+            # asyncio.Process has no public close(). Close its CPython transport
+            # only when inherited handles did not drain within the deadline.
+            transport = getattr(proc, "_transport", None)
+            if transport is not None:
+                transport.close()
+            for task in pending:
+                task.cancel()
+    if pending:
+        # Cancellation and pipe closure also have a finite grace period.
+        await asyncio.wait(pending, timeout=CLEANUP_TIMEOUT)
 
 
 def work_size(directory: Path) -> int:
-    return sum(p.stat().st_size for p in directory.iterdir() if p.is_file())
+    size = 0
+    for path in directory.iterdir():
+        try:
+            info = path.stat()
+        except FileNotFoundError:
+            continue  # A downloader/merger renamed the file during this scan.
+        if stat.S_ISREG(info.st_mode):
+            size += info.st_size
+    return size
 
 
 def checked_file(path: Path, directory: Path, limit: int) -> Path:
@@ -96,25 +138,27 @@ def checked_file(path: Path, directory: Path, limit: int) -> Path:
     return resolved
 
 
-async def download(url: str, directory: Path, *, limit=MAX_UPLOAD_BYTES, timeout=600) -> Path:
-    url, site = validate_url(url)
+async def _download_attempt(url: str, directory: Path, site: str, limit: int, height: int) -> Path:
     proc = await asyncio.create_subprocess_exec(
-        *make_command(url, directory, site, limit),
+        *make_command(url, directory, site, limit, height=height),
         stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
         start_new_session=True,
     )
     reader = asyncio.create_task(proc.communicate())
     try:
-        async with asyncio.timeout(timeout):
-            while not reader.done():
-                await asyncio.sleep(0.25)
-                if work_size(directory) > MAX_WORK_BYTES:
-                    raise TooLarge
-            stdout, stderr = await reader
-    except BaseException:
-        await stop_process(proc)
-        await reader
-        raise
+        while not reader.done():
+            await asyncio.sleep(0.05)
+            if work_size(directory) > MAX_WORK_BYTES:
+                raise TooLarge
+        stdout, stderr = await reader
+    finally:
+        cleanup = asyncio.create_task(stop_process(proc, reader))
+        try:
+            await asyncio.shield(cleanup)
+        except asyncio.CancelledError:
+            # A cancellation arriving during cleanup must not abandon the group.
+            await asyncio.shield(cleanup)
+            raise
     error = stderr.decode("utf-8", errors="replace").lower()
     if "max-filesize" in error or "larger than" in error or "maximum file size" in error:
         raise TooLarge
@@ -124,10 +168,27 @@ async def download(url: str, directory: Path, *, limit=MAX_UPLOAD_BYTES, timeout
         raise DownloadError("Не удалось скачать видео. Проверь доступность ссылки или попробуй MeTube.")
     lines = stdout.decode("utf-8", errors="replace").splitlines()
     if not lines:
-        # yt-dlp can skip oversized formats without a nonzero exit status.
-        raise DownloadError("Видео не скачано: возможно, оно больше 50 МБ или недоступно. Попробуй MeTube.")
+        raise NoVideo("Видео не скачано: возможно, оно больше 50 МБ или недоступно. Попробуй MeTube.")
     try:
         path = Path(json.loads(lines[-1]))
     except (ValueError, TypeError):
         raise DownloadError("Не удалось определить скачанный файл.") from None
     return checked_file(path, directory, limit)
+
+
+async def download(url: str, directory: Path, *, limit=MAX_UPLOAD_BYTES, timeout=600) -> Path:
+    url, site = validate_url(url)
+    # One deadline covers all quality attempts, not a new timeout per attempt.
+    async with asyncio.timeout(timeout):
+        for height in QUALITY_HEIGHTS:
+            # Remove partial tracks and cookie copies before the next attempt.
+            with tempfile.TemporaryDirectory(prefix="attempt-", dir=directory) as tmp:
+                try:
+                    path = await _download_attempt(url, Path(tmp), site, limit, height)
+                except (TooLarge, NoVideo) as exc:
+                    last_error = exc
+                    continue
+                result = directory / ("video" + path.suffix)
+                path.replace(result)
+                return checked_file(result, directory, limit)
+        raise last_error

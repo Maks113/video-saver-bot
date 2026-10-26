@@ -113,8 +113,8 @@ class ResourceTests(unittest.IsolatedAsyncioTestCase):
                         script = "import sys; sys.stderr.write('unavailable'); sys.exit(1)"
                     else:
                         script = "import time; time.sleep(10)"
-                    cmd = [sys.executable, "-c", script, str(work)]
-                    with patch("app.downloader.make_command", return_value=cmd):
+                    with patch("app.downloader.make_command", side_effect=lambda url, directory, *args, **kwargs:
+                               [sys.executable, "-c", script, str(directory)]):
                         try:
                             await download("https://youtu.be/test", work, timeout=0.1 if i % 3 == 2 else 3)
                         except (DownloadError, TimeoutError):
