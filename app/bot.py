@@ -9,7 +9,7 @@ import tempfile
 from aiogram import Bot, Dispatcher, F
 from aiogram.client.session.aiohttp import AiohttpSession
 from aiogram.exceptions import TelegramAPIError
-from aiogram.filters import Command
+from aiogram.filters import Command, CommandObject
 from aiogram.types import FSInputFile, Message
 
 from app.downloader import DownloadError, TooLarge, download, validate_url, MAX_UPLOAD_BYTES
@@ -50,10 +50,16 @@ class VideoBot:
         self.dp.message.register(self.identify, Command("id"))
         self.dp.message.register(self.help, Command("start", "help"))
         self.dp.message.register(self.metube, Command("metube"))
+        self.dp.message.register(self.download_command, Command("download"))
         self.dp.message.register(self.receive, F.text)
 
     def allowed(self, message: Message) -> bool:
-        return bool(message.from_user and message.from_user.id in self.config.users and message.chat.type == "private")
+        return bool(
+            message.from_user
+            and message.from_user.id in self.config.users
+            and not message.sender_chat
+            and message.chat.type in {"private", "group", "supergroup"}
+        )
 
     async def identify(self, message: Message):
         if message.chat.type == "private" and message.from_user:
@@ -62,7 +68,9 @@ class VideoBot:
     async def help(self, message: Message):
         if self.allowed(message):
             await message.answer(
-                "Пришли одну ссылку на Instagram, YouTube, VK Видео или TikTok.\n"
+                "В личном чате пришли ссылку на Instagram, YouTube, VK Видео или TikTok.\n"
+                "В группе: /download@M113_video_saver_bot ссылка\n"
+                "Также можно отправить /download ответом на сообщение со ссылкой.\n"
                 "Скачаю видео в качестве до 720p и отправлю файл до 50 МБ.\n"
                 "Большие видео: /metube\n"
                 "Одна задача на пользователя; ссылки обрабатываются по очереди."
@@ -72,11 +80,22 @@ class VideoBot:
         if self.allowed(message):
             await message.answer("MeTube для больших видео (доступен из домашней сети):\n" + self.config.metube_url)
 
-    async def receive(self, message: Message):
+    async def download_command(self, message: Message, command: CommandObject):
         if not self.allowed(message):
             return
+        text = command.args
+        if not text and message.reply_to_message:
+            text = message.reply_to_message.text or message.reply_to_message.caption
+        await self.enqueue(message, text or "")
+
+    async def receive(self, message: Message):
+        if not self.allowed(message) or message.chat.type != "private":
+            return
+        await self.enqueue(message, message.text or "")
+
+    async def enqueue(self, message: Message, text: str):
         try:
-            url, _ = validate_url(message.text or "")
+            url, _ = validate_url(text)
         except DownloadError as exc:
             await message.answer(str(exc))
             return

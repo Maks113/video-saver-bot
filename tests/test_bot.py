@@ -53,7 +53,7 @@ class BotTests(unittest.IsolatedAsyncioTestCase):
         return SimpleNamespace(
             from_user=SimpleNamespace(id=user_id),
             chat=SimpleNamespace(type=chat_type),
-            text=text,
+            text=text, sender_chat=None, reply_to_message=None,
             answer=AsyncMock(), answer_video=AsyncMock(), answer_document=AsyncMock(),
         )
 
