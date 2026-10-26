@@ -1,0 +1,48 @@
+name: video-saver
+services:
+  metube:
+    image: ghcr.io/alexta69/metube:2026.10.25
+    restart: unless-stopped
+    ports:
+      - "${METUBE_BIND_IP:-127.0.0.1}:${METUBE_PORT:-8081}:8081"
+    environment:
+      PUID: "${PUID:-1000}"
+      PGID: "${PGID:-1000}"
+      MAX_CONCURRENT_DOWNLOADS: "1"
+      STATE_DIR: /state
+      TEMP_DIR: /downloads/.tmp
+      DELETE_FILE_ON_TRASHCAN: "ask"
+    volumes:
+      - ./data/metube/downloads:/downloads
+      - ./data/metube/state:/state
+    mem_limit: 2g
+    cpus: 2
+    logging:
+      driver: json-file
+      options: {max-size: "10m", max-file: "3"}
+  bot:
+    profiles: [bot]
+    build: .
+    restart: unless-stopped
+    init: true
+    user: "${PUID:-1000}:${PGID:-1000}"
+    environment:
+      TG_BOT_TOKEN: "${TG_BOT_TOKEN:-}"
+      TG_ALLOWED_USER_IDS: "${TG_ALLOWED_USER_IDS:-}"
+      METUBE_URL: "${METUBE_URL:-http://localhost:8081}"
+      DOWNLOAD_TIMEOUT: "600"
+      MAX_UPLOAD_BYTES: "50000000"
+      TMPDIR: /tmp
+    volumes:
+      - ./cookies:/cookies:ro
+    tmpfs:
+      - /tmp:size=268435456,mode=1777
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    mem_limit: 1g
+    cpus: 2
+    stop_grace_period: 20s
+    logging:
+      driver: json-file
+      options: {max-size: "10m", max-file: "3"}

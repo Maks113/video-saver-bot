@@ -1,0 +1,2 @@
+aiogram==3.31.0
+yt-dlp[default,deno]==2026.10.21
