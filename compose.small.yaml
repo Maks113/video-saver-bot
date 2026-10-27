@@ -1,0 +1,17 @@
+# One vCPU / one GiB RAM. MeTube is opt-in and not part of this deployment.
+services:
+  bot:
+    mem_limit: 256m
+    cpus: 0.5
+    environment:
+      MAX_UPLOAD_BYTES: "${MAX_UPLOAD_BYTES:-250000000}"
+      DOWNLOAD_TIMEOUT: "${DOWNLOAD_TIMEOUT:-900}"
+      UPLOAD_TIMEOUT: "${UPLOAD_TIMEOUT:-3600}"
+  downloader:
+    mem_limit: 384m
+    cpus: 1
+  telegram-bot-api:
+    mem_limit: 128m
+    cpus: 0.5
+  prepare-storage:
+    mem_limit: 128m

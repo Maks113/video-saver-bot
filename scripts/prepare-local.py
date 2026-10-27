@@ -25,10 +25,8 @@ if not 0 < limit <= 2_000_000_000:
     raise SystemExit("MAX_UPLOAD_BYTES must be between 1 and 2000000000.")
 if shutil.disk_usage(root).free < 3 * limit + 1_000_000_000:
     raise SystemExit("Insufficient free disk for media, merge tracks and reserve.")
-for name in ["data/bot-api", "data/bot-api-tmp", "data/bot-downloads", "cookies"]:
-    directory = root / name
-    directory.mkdir(parents=True, exist_ok=True)
-    if os.geteuid() == 0:
-        os.chown(directory, uid, gid)
-    directory.chmod(0o700)
-print("Local API settings and directories ready; no secrets printed.")
+for name in ["data/bot-api", "data/bot-api-tmp", "data/bot-downloads", "data/bot-state",
+             "data/bot-uploads", "data/download-requests", "data/download-results",
+             "data/worker-downloads", "cookies"]:
+    (root / name).mkdir(parents=True, exist_ok=True, mode=0o700)
+print("Local settings verified; setup container will assign storage ownership.")

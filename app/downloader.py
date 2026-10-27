@@ -139,6 +139,7 @@ async def _download_attempt(url: str, directory: Path, site: str, limit: int) ->
         *make_command(url, directory, site, limit),
         stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
         start_new_session=True,
+        env=child_environment(),
     )
     reader = asyncio.create_task(proc.communicate())
     try:
@@ -172,6 +173,18 @@ async def _download_attempt(url: str, directory: Path, site: str, limit: int) ->
     except (ValueError, TypeError):
         raise DownloadError("Не удалось определить скачанный файл.") from None
     return checked_file(path, directory, limit)
+
+
+def child_environment():
+    """No inherited bot/application tokens, session variables or Python hooks."""
+    env = {"PATH": os.environ.get("PATH", os.defpath), "LANG": "C.UTF-8",
+           "HOME": "/tmp", "TMPDIR": os.environ.get("TMPDIR", "/tmp"),
+           "XDG_CACHE_HOME": "/tmp/cache", "DENO_DIR": "/tmp/deno",
+           "PYTHONDONTWRITEBYTECODE": "1"}
+    for name in ("SSL_CERT_FILE", "SSL_CERT_DIR"):
+        if name in os.environ:
+            env[name] = os.environ[name]
+    return env
 
 
 async def download(url: str, directory: Path, *, limit=MAX_UPLOAD_BYTES, timeout=600) -> Path:

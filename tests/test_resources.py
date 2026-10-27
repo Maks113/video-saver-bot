@@ -19,6 +19,13 @@ from app.downloader import DownloadError, TooLarge, download
 
 
 class ResourceTests(unittest.IsolatedAsyncioTestCase):
+    def setUp(self):
+        super().setUp()
+        disk = patch("app.downloader.shutil.disk_usage",
+                     return_value=SimpleNamespace(free=100_000_000_000))
+        disk.start()
+        self.addCleanup(disk.stop)
+
     async def test_worker_memory_and_temp_files_stay_bounded_across_240_jobs(self):
         service = VideoBot(Config("123:fake", frozenset({123}), "http://metube", 100_000, 600))
         outcome = 0

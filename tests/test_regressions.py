@@ -19,6 +19,13 @@ from app.downloader import download, make_command, work_size, TooLarge
 
 
 class ReviewRegressions(unittest.IsolatedAsyncioTestCase):
+    def setUp(self):
+        super().setUp()
+        disk = patch("app.downloader.shutil.disk_usage",
+                     return_value=SimpleNamespace(free=100_000_000_000))
+        disk.start()
+        self.addCleanup(disk.stop)
+
     async def test_dead_parent_with_child_holding_pipes_cannot_stall_next_job(self):
         service = VideoBot(Config("123:fake", frozenset({123, 456}), "http://metube", 50_000_000, 0.4))
         with tempfile.TemporaryDirectory() as tmp:
@@ -44,7 +51,11 @@ class ReviewRegressions(unittest.IsolatedAsyncioTestCase):
             service.pending.update({123, 456})
             service.queue.put_nowait((first, statuses[0], "https://youtu.be/first", 123))
             service.queue.put_nowait((second, statuses[1], "https://youtu.be/second", 456))
-            with patch("app.downloader.make_command", side_effect=command):
+            async def direct_download(url, directory, **kwargs):
+                return await download(url, directory, limit=kwargs["limit"], timeout=kwargs["timeout"])
+
+            with patch("app.downloader.make_command", side_effect=command), \
+                    patch("app.bot.download", new=direct_download):
                 worker = asyncio.create_task(service.worker())
                 drained = asyncio.create_task(service.queue.join())
                 try:
@@ -135,6 +146,13 @@ class FileAndFormatRegressions(unittest.TestCase):
 
 
 class AdditionalBoundaryRegressions(unittest.IsolatedAsyncioTestCase):
+    def setUp(self):
+        super().setUp()
+        disk = patch("app.downloader.shutil.disk_usage",
+                     return_value=SimpleNamespace(free=100_000_000_000))
+        disk.start()
+        self.addCleanup(disk.stop)
+
     async def test_oversized_merged_result_is_rejected_and_cleaned_without_retry(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)

@@ -256,7 +256,7 @@ class LocalConfigTests(unittest.TestCase):
     def test_local_defaults_and_explicit_transport_settings(self):
         config = self.config()
         self.assertEqual(config.api_base, "http://telegram-bot-api:8081")
-        self.assertEqual(config.download_dir, Path("/downloads"))
+        self.assertEqual(config.download_dir, Path("/uploads"))
         self.assertEqual(config.upload_timeout, 7200)
         config = self.config(BOT_API_BASE="http://api:8081/", DOWNLOAD_DIR="/data/shared",
                              UPLOAD_TIMEOUT="3600", MAX_UPLOAD_BYTES="1900000000")
@@ -291,7 +291,7 @@ class MigrationEntryTests(unittest.TestCase):
         with patch("app.migrate_api.Config.load", return_value=MagicMock()), \
                 patch("app.migrate_api.asyncio.run", side_effect=failed), \
                 patch("sys.stderr", output):
-            self.assertEqual(migration.main(), 1)
+            self.assertEqual(migration.main([]), 1)
         self.assertIn("RuntimeError", output.getvalue())
         self.assertNotIn("secret-token", output.getvalue())
 
@@ -303,8 +303,8 @@ class MigrationEntryTests(unittest.TestCase):
             coroutine.close()
 
         with patch("app.migrate_api.Config.load", return_value=MagicMock()), \
-                patch("asyncio.run", side_effect=close):
-            self.assertEqual(migration.main(), 0)
+                patch("asyncio.run", side_effect=close), patch("sys.argv", ["migrate_api"]):
+            self.assertEqual(migration.main([]), 0)
             with self.assertRaises(SystemExit) as exit_:
                 runpy.run_path(migration.__file__, run_name="__main__")
             self.assertEqual(exit_.exception.code, 0)

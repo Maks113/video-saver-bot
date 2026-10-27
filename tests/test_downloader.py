@@ -140,6 +140,13 @@ class StopProcesses(unittest.IsolatedAsyncioTestCase):
 
 
 class Subprocesses(unittest.IsolatedAsyncioTestCase):
+    def setUp(self):
+        super().setUp()
+        disk = patch("app.downloader.shutil.disk_usage",
+                     return_value=SimpleNamespace(free=100_000_000_000))
+        disk.start()
+        self.addCleanup(disk.stop)
+
     async def execute(self, script, **kwargs):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -222,3 +229,12 @@ class Subprocesses(unittest.IsolatedAsyncioTestCase):
                         await task
                 with self.assertRaises(ProcessLookupError):
                     os.kill(pid, 0)
+
+    async def test_real_child_never_inherits_telegram_or_python_hook_secrets(self):
+        with patch.dict("os.environ", {"TG_BOT_TOKEN": "fake", "TELEGRAM_API_HASH": "fake",
+                                      "GH_TOKEN": "fake", "PYTHONPATH": "/untrusted"}):
+            await self.execute(
+                "import os,pathlib,sys,json; "
+                "assert not {'TG_BOT_TOKEN','TELEGRAM_API_HASH','GH_TOKEN','PYTHONPATH'} & os.environ.keys(); "
+                "p=pathlib.Path(sys.argv[1])/'video.mp4'; p.write_bytes(b'video'); print(json.dumps(str(p)))"
+            )

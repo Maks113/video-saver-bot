@@ -2,21 +2,22 @@
 from contextlib import contextmanager
 import fcntl
 import json
+import os
 from pathlib import Path
 import shutil
 
-from aiogram.client.session.aiohttp import AiohttpSession
-from aiogram.client.telegram import TelegramAPIServer
 
 MARKER = ".local-api.json"
 
 
 def local_session(base: str, timeout: int):
+    from aiogram.client.session.aiohttp import AiohttpSession
+    from aiogram.client.telegram import TelegramAPIServer
     return AiohttpSession(api=TelegramAPIServer.from_base(base, is_local=True), timeout=timeout)
 
 
 @contextmanager
-def workspace(root: Path):
+def workspace(root: Path, *, cleanup_roots=()):
     if root is None:
         raise SystemExit("DOWNLOAD_DIR is required for Local Bot API.")
     root.mkdir(parents=True, exist_ok=True, mode=0o700)
@@ -26,9 +27,11 @@ def workspace(root: Path):
         except BlockingIOError:
             raise SystemExit("Another bot or migration already owns DOWNLOAD_DIR.") from None
         # The exclusive lock ensures there are no live jobs in this directory.
-        for path in root.glob("video-saver-*"):
-            if path.is_dir() and not path.is_symlink():
-                shutil.rmtree(path)
+        for directory in (root, *cleanup_roots):
+            if directory is not None:
+                for path in directory.glob("video-saver-*"):
+                    if path.is_dir() and not path.is_symlink():
+                        shutil.rmtree(path)
         yield root
 
 
@@ -47,12 +50,21 @@ def migration_state(root: Path):
 def write_migration(root: Path, token: str, base: str, stage: str):
     value = {"bot_id": token.split(":", 1)[0], "api_base": base, "stage": stage}
     pending = root / (MARKER + ".tmp")
-    pending.write_text(json.dumps(value))
-    pending.chmod(0o600)
+    with pending.open("w") as file:
+        os.fchmod(file.fileno(), 0o600)
+        json.dump(value, file)
+        file.flush()
+        os.fsync(file.fileno())
     pending.replace(root / MARKER)
+    directory = os.open(root, os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        os.fsync(directory)
+    finally:
+        os.close(directory)
 
 
 def require_local_ready(root: Path, token: str, base: str):
-    expected = {"bot_id": token.split(":", 1)[0], "api_base": base, "stage": "ready"}
-    if migration_state(root) != expected:
+    state = migration_state(root)
+    expected = {"bot_id": token.split(":", 1)[0], "api_base": base, "stage": state.get("stage")}
+    if state != expected or state.get("stage") not in {"ready", "ready_unconfirmed"}:
         raise SystemExit("Run scripts/switch-local-api.sh before starting local polling.")

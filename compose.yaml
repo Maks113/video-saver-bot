@@ -1,6 +1,8 @@
 name: video-saver
 services:
   metube:
+    profiles: [web]
+    networks: [media]
     image: ghcr.io/alexta69/metube:2026.10.25
     restart: unless-stopped
     ports: ["${METUBE_BIND_IP:-127.0.0.1}:${METUBE_PORT:-8081}:8081"]
@@ -20,6 +22,7 @@ services:
       driver: json-file
       options: {max-size: "10m", max-file: "3"}
   telegram-bot-api:
+    networks: [telegram]
     profiles: [bot]
     image: aiogram/telegram-bot-api@sha256:3f92ea1b5fcb27344d991ab1464af08675a2e202f901c68fccdf570d77ec02bf
     restart: unless-stopped
@@ -33,6 +36,7 @@ services:
       - --http-port=8081
       - --http-ip-address=0.0.0.0
       - --http-stat-port=8082
+      - --http-stat-ip-address=127.0.0.1
       - --verbosity=0
     environment:
       TELEGRAM_API_ID: "${TELEGRAM_API_ID:-}"
@@ -40,7 +44,7 @@ services:
     volumes:
       - ./data/bot-api:/var/lib/telegram-bot-api
       - ./data/bot-api-tmp:/api-tmp
-      - ./data/bot-downloads:/downloads:ro
+      - ./data/bot-uploads:/uploads:ro
     healthcheck:
       test: ["CMD", "wget", "-q", "-O", "/dev/null", "http://127.0.0.1:8082/"]
       interval: 5s
@@ -55,11 +59,52 @@ services:
     logging:
       driver: json-file
       options: {max-size: "10m", max-file: "3"}
+  downloader:
+    profiles: [bot]
+    networks: [download]
+    image: video-saver-bot
+    user: "${DOWNLOADER_UID:-65532}:${PGID:-1000}"
+    restart: unless-stopped
+    init: true
+    command: ["python", "-m", "app.download_worker"]
+    environment:
+      REQUEST_DIR: /requests
+      RESULT_DIR: /results
+      OUTPUT_DIR: /downloads
+      HOME: /tmp
+      TMPDIR: /tmp
+      XDG_CACHE_HOME: /tmp/cache
+      DENO_DIR: /tmp/deno
+    volumes:
+      - ./data/download-requests:/requests:ro
+      - ./data/download-results:/results
+      - ./data/worker-downloads:/downloads
+      - ./cookies:/cookies:ro
+    tmpfs:
+      - /tmp:size=67108864,mode=1777
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    mem_limit: 1g
+    cpus: 2
+    stop_grace_period: 20s
+    healthcheck:
+      test: ["CMD", "python", "-c", "import time; from pathlib import Path; raise SystemExit(time.time()-Path('/tmp/downloader-heartbeat').stat().st_mtime > 20)"]
+      interval: 5s
+      timeout: 3s
+      retries: 12
+    logging:
+      driver: json-file
+      options: {max-size: "10m", max-file: "3"}
   bot:
+    networks: [telegram]
     profiles: [bot]
     build: .
+    image: video-saver-bot
     depends_on:
       telegram-bot-api:
+        condition: service_healthy
+      downloader:
         condition: service_healthy
     restart: unless-stopped
     init: true
@@ -67,16 +112,23 @@ services:
     environment:
       TG_BOT_TOKEN: "${TG_BOT_TOKEN:-}"
       TG_ALLOWED_USER_IDS: "${TG_ALLOWED_USER_IDS:-}"
-      METUBE_URL: "${METUBE_URL:-http://localhost:8081}"
+      METUBE_URL: "${METUBE_URL-}"
       BOT_API_BASE: http://telegram-bot-api:8081
-      DOWNLOAD_DIR: /downloads
+      DOWNLOAD_DIR: /uploads
+      STATE_DIR: /state
+      REQUEST_DIR: /requests
+      RESULT_DIR: /results
+      WORKER_OUTPUT_DIR: /downloads
       DOWNLOAD_TIMEOUT: "${DOWNLOAD_TIMEOUT:-1800}"
       UPLOAD_TIMEOUT: "${UPLOAD_TIMEOUT:-7200}"
       MAX_UPLOAD_BYTES: "${MAX_UPLOAD_BYTES:-2000000000}"
       TMPDIR: /tmp
     volumes:
-      - ./cookies:/cookies:ro
-      - ./data/bot-downloads:/downloads
+      - ./data/bot-state:/state
+      - ./data/bot-uploads:/uploads
+      - ./data/download-requests:/requests
+      - ./data/download-results:/results:ro
+      - ./data/worker-downloads:/downloads:ro
     tmpfs:
       - /tmp:size=67108864,mode=1777
     read_only: true
@@ -88,3 +140,32 @@ services:
     logging:
       driver: json-file
       options: {max-size: "10m", max-file: "3"}
+  prepare-storage:
+    profiles: [setup]
+    image: video-saver-bot
+    user: "0:0"
+    network_mode: none
+    command: ["python", "-m", "app.prepare_storage"]
+    environment:
+      PUID: "${PUID:-1000}"
+      PGID: "${PGID:-1000}"
+      DOWNLOADER_UID: "${DOWNLOADER_UID:-65532}"
+    volumes:
+      - ./data/bot-state:/state
+      - ./data/bot-uploads:/uploads
+      - ./data/download-requests:/requests
+      - ./data/download-results:/results
+      - ./data/worker-downloads:/downloads
+      - ./cookies:/cookies
+      - ./data/bot-api:/api-state
+      - ./data/bot-api-tmp:/api-tmp
+      - ./data/bot-downloads:/legacy:ro
+    read_only: true
+    cap_drop: [ALL]
+    cap_add: [CHOWN, FOWNER, DAC_OVERRIDE]
+    security_opt: [no-new-privileges:true]
+    mem_limit: 256m
+networks:
+  media:
+  telegram:
+  download:

@@ -1,6 +1,7 @@
 .env
 .env.*
 !.env.example
+!.env.small.example
 cookies/*
 !cookies/.gitkeep
 data/

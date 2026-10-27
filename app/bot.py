@@ -12,7 +12,8 @@ from aiogram.filters import Command, CommandObject
 from aiogram.types import Message
 from urllib.parse import urlsplit
 
-from app.downloader import DownloadError, TooLarge, download, validate_url, MAX_UPLOAD_BYTES
+from app.downloader import DownloadError, TooLarge, validate_url, MAX_UPLOAD_BYTES
+from app.download_client import clear_requests, download
 from app.runtime import local_session, require_local_ready, workspace
 
 log = logging.getLogger(__name__)
@@ -29,6 +30,10 @@ class Config:
     api_base: str = "http://telegram-bot-api:8081"
     download_dir: Path | None = None
     upload_timeout: int = 7200
+    state_dir: Path | None = None
+    request_dir: Path | None = None
+    result_dir: Path | None = None
+    worker_output_dir: Path | None = None
 
     @classmethod
     def load(cls):
@@ -50,11 +55,17 @@ class Config:
             port = parsed.port
         except ValueError:
             raise SystemExit("Invalid BOT_API_BASE.") from None
-        root = Path(os.environ.get("DOWNLOAD_DIR", "/downloads"))
+        root = Path(os.environ.get("DOWNLOAD_DIR", "/uploads"))
+        state = Path(os.environ.get("STATE_DIR", "/state"))
+        requests = Path(os.environ.get("REQUEST_DIR", "/requests"))
+        results = Path(os.environ.get("RESULT_DIR", "/results"))
+        worker_output = Path(os.environ.get("WORKER_OUTPUT_DIR", "/downloads"))
         if parsed.scheme not in {"http", "https"} or not parsed.hostname or parsed.username or parsed.password or parsed.query or parsed.fragment or port == 0 or not root.is_absolute():
             raise SystemExit("Invalid BOT_API_BASE or DOWNLOAD_DIR.")
+        if not all(path.is_absolute() for path in (state, requests, results, worker_output)):
+            raise SystemExit("Worker paths must be absolute.")
         return cls(token, users, os.environ.get("METUBE_URL", "http://localhost:8081"), limit, timeout,
-                   base, root, upload_timeout)
+                   base, root, upload_timeout, state, requests, results, worker_output)
 
 
 class VideoBot:
@@ -88,13 +99,14 @@ class VideoBot:
                 "В группе: /download@M113_video_saver_bot ссылка\n"
                 "Также можно отправить /download ответом на сообщение со ссылкой.\n"
                 f"Качество выбирается автоматически; файл до {self.config.limit / 1_000_000:g} МБ.\n"
-                "Большие видео: /metube\n"
-                "Одна задача на пользователя; ссылки обрабатываются по очереди."
+                + ("Большие видео: /metube\n" if self.config.metube_url else "")
+                + "Одна задача на пользователя; ссылки обрабатываются по очереди."
             )
 
     async def metube(self, message: Message):
         if self.allowed(message):
-            await message.answer("MeTube для больших видео (доступен из домашней сети):\n" + self.config.metube_url)
+            await message.answer("MeTube:\n" + self.config.metube_url if self.config.metube_url
+                                 else "MeTube на этом сервере отключён.")
 
     async def download_command(self, message: Message, command: CommandObject):
         if not self.allowed(message):
@@ -138,6 +150,9 @@ class VideoBot:
             # Status is optional; deleted messages/network errors cannot abort a job.
             log.debug("Status update unavailable")
 
+    def fallback_hint(self):
+        return "\nMeTube:\n" + self.config.metube_url if self.config.metube_url else ""
+
     async def worker(self):
         while True:
             message, status, url, user_id = await self.queue.get()
@@ -145,22 +160,25 @@ class VideoBot:
                 await self.update_status(status, "Скачиваю видео…")
                 with tempfile.TemporaryDirectory(prefix="video-saver-", dir=self.config.download_dir) as tmp:
                     try:
-                        path = await download(url, Path(tmp), limit=self.config.limit, timeout=self.config.timeout)
+                        path = await download(url, Path(tmp), limit=self.config.limit, timeout=self.config.timeout,
+                                              request_dir=self.config.request_dir, result_dir=self.config.result_dir,
+                                              output_root=self.config.worker_output_dir)
                     except TooLarge:
-                        await self.update_status(status, f"Видео больше лимита {self.config.limit / 1_000_000:g} МБ. MeTube:\n" + self.config.metube_url)
+                        await self.update_status(status, f"Видео больше лимита {self.config.limit / 1_000_000:g} МБ." + self.fallback_hint())
                         continue
                     except TimeoutError:
-                        await self.update_status(status, f"Скачивание превысило лимит {self.config.timeout:g} с. MeTube:\n" + self.config.metube_url)
+                        await self.update_status(status, f"Скачивание превысило лимит {self.config.timeout:g} с." + self.fallback_hint())
                         continue
                     except DownloadError as exc:
                         await self.update_status(status, str(exc))
                         continue
                     # Check actual final bytes immediately before uploading.
                     if path.stat().st_size > self.config.limit:
-                        await self.update_status(status, f"Видео больше лимита {self.config.limit / 1_000_000:g} МБ. MeTube:\n" + self.config.metube_url)
+                        await self.update_status(status, f"Видео больше лимита {self.config.limit / 1_000_000:g} МБ." + self.fallback_hint())
                         continue
                     await self.update_status(status, "Отправляю видео…")
-                    # Both containers mount the same absolute /downloads path.
+                    # This copy belongs to the bot. The downloader cannot modify
+                    # its path or content while Local Bot API reads it.
                     file = path.as_uri()
                     if path.suffix.lower() == ".mp4":
                         await message.answer_video(file, supports_streaming=True, request_timeout=self.config.upload_timeout)
@@ -178,8 +196,11 @@ class VideoBot:
                 self.queue.task_done()
 
     async def run(self):
-        with workspace(self.config.download_dir) as root:
+        with workspace(self.config.state_dir or self.config.download_dir,
+                       cleanup_roots=(self.config.download_dir,)) as root:
             require_local_ready(root, self.config.token, self.config.api_base)
+            if self.config.request_dir is not None:
+                clear_requests(self.config.request_dir)
             await self.poll()
 
     async def poll(self):
