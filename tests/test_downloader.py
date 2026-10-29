@@ -175,6 +175,11 @@ class Subprocesses(unittest.IsolatedAsyncioTestCase):
         with self.assertRaisesRegex(DownloadError, "авторизация"):
             await self.execute("import sys; sys.stderr.write('Please log in'); sys.exit(1)")
 
+    async def test_instagram_audience_rejection_is_classified_for_fallback(self):
+        from app.downloader import AccessRestricted
+        with self.assertRaises(AccessRestricted):
+            await self.execute("import sys; sys.stderr.write(\"This content isn't available to everyone: It can't be seen by certain audiences.\"); sys.exit(1)")
+
     async def test_handles_generic_failure(self):
         with self.assertRaisesRegex(DownloadError, "Не удалось скачать"):
             await self.execute("import sys; sys.stderr.write('unavailable'); sys.exit(1)")
@@ -238,3 +243,82 @@ class Subprocesses(unittest.IsolatedAsyncioTestCase):
                 "assert not {'TG_BOT_TOKEN','TELEGRAM_API_HASH','GH_TOKEN','PYTHONPATH'} & os.environ.keys(); "
                 "p=pathlib.Path(sys.argv[1])/'video.mp4'; p.write_bytes(b'video'); print(json.dumps(str(p)))"
             )
+
+
+class InstagramFallback(unittest.IsolatedAsyncioTestCase):
+    async def run_attempts(self, errors, *, cookie_exists=True, timeout=10):
+        calls, directories = [], []
+        original_is_file = Path.is_file
+
+        def is_file(path):
+            if path == Path('/cookies/instagram.txt'):
+                return cookie_exists
+            return original_is_file(path)
+
+        async def attempt(url, directory, site, limit, *, use_cookies):
+            calls.append(use_cookies)
+            directories.append(directory)
+            # Previous attempts, including partial files, must already be gone.
+            self.assertTrue(all(not p.exists() for p in directories[:-1]))
+            (directory / 'video.part').write_bytes(b'partial')
+            error = errors[len(calls) - 1]
+            if isinstance(error, BaseException):
+                raise error
+            if error == 'slow':
+                await asyncio.sleep(1)
+            video = directory / 'video.mp4'
+            video.write_bytes(b'video')
+            return video
+
+        with tempfile.TemporaryDirectory() as tmp:
+            with patch('app.downloader.shutil.disk_usage', return_value=SimpleNamespace(free=100_000_000_000)), \
+                 patch.object(Path, 'is_file', is_file), \
+                 patch('app.downloader._download_attempt', side_effect=attempt):
+                try:
+                    result = await download('https://instagram.com/reel/test', Path(tmp), timeout=timeout)
+                    self.assertEqual(result.read_bytes(), b'video')
+                finally:
+                    self.calls = calls
+                    self.assertTrue(all(not p.exists() for p in directories))
+        return calls
+
+    async def test_public_success_never_uses_account(self):
+        self.assertEqual(await self.run_attempts([None]), [False])
+
+    async def test_access_rejection_retries_once_in_clean_directory(self):
+        from app.downloader import AccessRestricted
+        self.assertEqual(await self.run_attempts([AccessRestricted(), None]), [False, True])
+
+    async def test_no_cookie_no_retry(self):
+        from app.downloader import AccessRestricted
+        with self.assertRaises(AccessRestricted):
+            await self.run_attempts([AccessRestricted()], cookie_exists=False)
+        self.assertEqual(self.calls, [False])
+
+    async def test_other_failures_never_use_account(self):
+        for error in [TooLarge(), DownloadError('network'), TimeoutError(), asyncio.CancelledError()]:
+            with self.subTest(error=type(error).__name__), self.assertRaises(type(error)):
+                await self.run_attempts([error])
+            self.assertEqual(self.calls, [False])
+
+    async def test_invalid_session_does_not_loop(self):
+        from app.downloader import AccessRestricted
+        with self.assertRaises(AccessRestricted):
+            await self.run_attempts([AccessRestricted(), AccessRestricted()])
+        self.assertEqual(self.calls, [False, True])
+
+    async def test_authenticated_attempt_still_obeys_deadline(self):
+        from app.downloader import AccessRestricted
+        with self.assertRaises(TimeoutError):
+            await self.run_attempts([AccessRestricted(), 'slow'], timeout=0.05)
+        self.assertEqual(self.calls, [False, True])
+
+    def test_anonymous_command_does_not_copy_existing_cookie(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            work = Path(tmp)
+            with patch.object(Path, 'is_file', return_value=True), \
+                 patch('app.downloader.shutil.copyfile') as copy:
+                cmd = make_command('https://instagram.com/reel/test', work, 'instagram', 100,
+                                   use_cookies=False)
+            self.assertNotIn('--cookies', cmd)
+            copy.assert_not_called()

@@ -27,6 +27,10 @@ class DownloadError(Exception):
     pass
 
 
+class AccessRestricted(DownloadError):
+    """The platform explicitly requires authentication or restricts the audience."""
+
+
 class TooLarge(DownloadError):
     pass
 
@@ -49,7 +53,7 @@ def validate_url(text: str) -> tuple[str, str]:
     raise DownloadError("Поддерживаются Instagram, YouTube, VK Видео и TikTok.")
 
 
-def make_command(url: str, directory: Path, site: str, limit: int) -> list[str]:
+def make_command(url: str, directory: Path, site: str, limit: int, *, use_cookies=True) -> list[str]:
     cmd = [
         sys.executable, "-m", "yt_dlp",
         "--ignore-config", "--no-playlist", "--playlist-items", "1",
@@ -67,7 +71,7 @@ def make_command(url: str, directory: Path, site: str, limit: int) -> list[str]:
         "--print", "after_move:%(filepath)j",
     ]
     source = Path("/cookies") / (site + ".txt")
-    if source.is_file():
+    if use_cookies and source.is_file():
         # yt-dlp may write its cookie jar; mount the original read-only.
         target = directory / "cookies.txt"
         shutil.copyfile(source, target)
@@ -134,9 +138,9 @@ def checked_file(path: Path, directory: Path, limit: int) -> Path:
     return resolved
 
 
-async def _download_attempt(url: str, directory: Path, site: str, limit: int) -> Path:
+async def _download_attempt(url: str, directory: Path, site: str, limit: int, *, use_cookies=True) -> Path:
     proc = await asyncio.create_subprocess_exec(
-        *make_command(url, directory, site, limit),
+        *make_command(url, directory, site, limit, use_cookies=use_cookies),
         stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
         start_new_session=True,
         env=child_environment(),
@@ -162,7 +166,10 @@ async def _download_attempt(url: str, directory: Path, site: str, limit: int) ->
     if "max-filesize" in error or "larger than" in error or "maximum file size" in error:
         raise TooLarge
     if proc.returncode:
-        if any(word in error for word in ("cookies", "login", "sign in", "log in", "403", "429")):
+        if any(word in error for word in ("cookies", "login", "sign in", "log in", "403",
+                                           "content isn't available to everyone", "certain audiences")):
+            raise AccessRestricted("Площадка ограничила доступ: нужна действующая авторизация аккаунта с доступом к ролику.")
+        if "429" in error:
             raise DownloadError("Площадка ограничила доступ: может потребоваться авторизация или повтор позже.")
         raise DownloadError("Не удалось скачать видео. Проверь доступность ссылки или попробуй MeTube.")
     lines = stdout.decode("utf-8", errors="replace").splitlines()
@@ -192,8 +199,18 @@ async def download(url: str, directory: Path, *, limit=MAX_UPLOAD_BYTES, timeout
     if shutil.disk_usage(directory).free < 3 * limit + DISK_RESERVE_BYTES:
         raise DownloadError("На сервере недостаточно места для видео и временных дорожек.")
     async with asyncio.timeout(timeout):
-        with tempfile.TemporaryDirectory(prefix="attempt-", dir=directory) as tmp:
-            path = await _download_attempt(url, Path(tmp), site, limit)
-            result = directory / ("video" + path.suffix)
-            path.replace(result)
-            return checked_file(result, directory, limit)
+        # Instagram uses the account only after an explicit access rejection.
+        # Each attempt gets fresh files; both share the same timeout budget.
+        attempts = (False, True) if site == "instagram" else (True,)
+        for use_cookies in attempts:
+            with tempfile.TemporaryDirectory(prefix="attempt-", dir=directory) as tmp:
+                try:
+                    path = await _download_attempt(url, Path(tmp), site, limit,
+                                                   use_cookies=use_cookies)
+                except AccessRestricted:
+                    if site == "instagram" and not use_cookies and (Path("/cookies") / "instagram.txt").is_file():
+                        continue
+                    raise
+                result = directory / ("video" + path.suffix)
+                path.replace(result)
+                return checked_file(result, directory, limit)
